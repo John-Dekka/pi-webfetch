@@ -14,9 +14,9 @@
  * 2. Use the webfetch tool in your prompts
  */
 
-import type { ExtensionAPI, TruncationResult } from "@mariozechner/pi-coding-agent";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, TruncationResult } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "fs";
 
