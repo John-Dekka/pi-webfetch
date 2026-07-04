@@ -8,17 +8,20 @@
  * - Uses @mozilla/readability for clean content extraction
  * - Special handling for GitHub (raw API for READMEs, issues, PRs, files)
  * - Falls back to basic HTML parsing if readability fails
+ * - Slash command `/webfetch <url> <path>` to fetch and save directly to a file
  * 
  * Usage:
  * 1. Copy to ~/.pi/agent/extensions/webfetch.ts or .pi/extensions/webfetch.ts
- * 2. Use the webfetch tool in your prompts
+ * 2. Use the webfetch tool in your prompts, or /webfetch command in the editor
  */
 
 import type { ExtensionAPI, TruncationResult } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "fs";
+import { writeFileSync, mkdirSync } from "fs";
+import { writeFile } from "fs/promises";
+import { dirname, resolve } from "path";
 
 // ============
 // Configuration
@@ -41,6 +44,14 @@ interface WebFetchDetails {
 	contentLength?: number;
 	truncation?: TruncationResult;
 	contentType?: string;
+}
+
+interface FetchResult {
+	text: string;
+	title?: string;
+	extractor: string;
+	contentType: string;
+	finalUrl: string;
 }
 
 // ============
@@ -182,13 +193,6 @@ const GITHUB_URL_PATTERNS = [
  * Parse GitHub URL to extract repo info
  */
 function parseGitHubUrl(url: string): GitHubRepoInfo | null {
-	// Match patterns like:
-	// https://github.com/owner/repo
-	// https://github.com/owner/repo/tree/main
-	// https://github.com/owner/repo/blob/main/README.md
-	// https://github.com/owner/repo/issues/1
-	// https://github.com/owner/repo/pulls/1
-	// https://github.com/owner/repo/raw/main/README.md
 	for (const pattern of GITHUB_URL_PATTERNS) {
 		const match = url.match(pattern);
 		if (match) {
@@ -214,7 +218,6 @@ async function fetchGitHubContent(url: string): Promise<string | null> {
 
 	// For tree/repo root, fetch README
 	if (!path || path === "") {
-		// Try to get the default branch first, then README
 		try {
 			const repoResp = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
 				headers: {
@@ -223,10 +226,9 @@ async function fetchGitHubContent(url: string): Promise<string | null> {
 				},
 			});
 			if (!repoResp.ok) return null;
-			const repoData = await repoResp.json();
+			const repoData = await repoResp.json() as { default_branch?: string };
 			const defaultBranch = repoData.default_branch || "main";
 
-			// Try README.md in root
 			const readmeResp = await fetch(
 				`https://api.github.com/repos/${owner}/${repo}/readme`,
 				{
@@ -259,11 +261,17 @@ async function fetchGitHubContent(url: string): Promise<string | null> {
 				}
 			);
 			if (resp.ok) {
-				const data = await resp.json();
-				// Format issue as markdown
+				const data = await resp.json() as {
+					title?: string;
+					number?: number;
+					user?: { login?: string };
+					labels?: Array<{ name: string }>;
+					state?: string;
+					body?: string | null;
+				};
 				let md = `# ${data.title}\n\n`;
 				md += `**#${data.number}** by ${data.user?.login || "unknown"}\n`;
-				md += `Labels: ${data.labels?.map((l: any) => l.name).join(", ") || "none"}\n`;
+				md += `Labels: ${data.labels?.map((l) => l.name).join(", ") || "none"}\n`;
 				md += `State: ${data.state}\n\n`;
 				md += `---\n\n`;
 				md += data.body || "(no description)";
@@ -286,12 +294,22 @@ async function fetchGitHubContent(url: string): Promise<string | null> {
 				}
 			);
 			if (resp.ok) {
-				const data = await resp.json();
+				const data = await resp.json() as {
+					title?: string;
+					number?: number;
+					user?: { login?: string };
+					state?: string;
+					draft?: boolean;
+					base?: { ref?: string };
+					head?: { ref?: string };
+					labels?: Array<{ name: string }>;
+					body?: string | null;
+				};
 				let md = `# ${data.title}\n\n`;
 				md += `**PR #${data.number}** by ${data.user?.login || "unknown"}\n`;
 				md += `State: ${data.state} | Draft: ${data.draft}\n`;
 				md += `Base: ${data.base?.ref} ← Head: ${data.head?.ref}\n`;
-				md += `Labels: ${data.labels?.map((l: any) => l.name).join(", ") || "none"}\n\n`;
+				md += `Labels: ${data.labels?.map((l) => l.name).join(", ") || "none"}\n\n`;
 				md += `---\n\n`;
 				md += data.body || "(no description)";
 				return md;
@@ -302,8 +320,8 @@ async function fetchGitHubContent(url: string): Promise<string | null> {
 
 	// For raw file content
 	if (parsed.isRaw || url.includes("/blob/")) {
-		const filePath = url.includes("/blob/") 
-			? url.split("/blob/[^/]+/")[1] 
+		const filePath = url.includes("/blob/")
+			? url.split("/blob/[^/]+/")[1]
 			: path;
 		if (filePath) {
 			const resp = await fetch(
@@ -316,8 +334,7 @@ async function fetchGitHubContent(url: string): Promise<string | null> {
 				}
 			);
 			if (resp.ok) {
-				const data = await resp.json();
-				// Return content with file header
+				const data = await resp.text();
 				return `\`\`\`${getCodeLanguage(filePath)}\n${data}\n\`\`\``;
 			}
 		}
@@ -451,10 +468,128 @@ function htmlToMarkdown(html: string): { text: string; title?: string } {
 }
 
 // ============
+// Shared fetch-and-extract helper (used only by the /webfetch command)
+// ============
+
+/**
+ * Fetch a URL and extract its content as markdown (or text).
+ * Handles GitHub URLs specially, uses Readability for HTML pages,
+ * and falls back to basic HTML parsing.
+ */
+async function fetchAndExtract(
+	url: string,
+	extractMode: "markdown" | "text",
+	signal?: AbortSignal,
+	timeout: number = DEFAULT_TIMEOUT,
+): Promise<FetchResult> {
+	if (!url.startsWith("http://") && !url.startsWith("https://")) {
+		throw new Error("URL must start with http:// or https://");
+	}
+
+	const headers = {
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+		"Accept": "text/markdown, text/x-markdown, text/html;q=0.9, */*;q=0.1",
+		"Accept-Language": "en-US,en;q=0.9",
+	};
+
+	const controller = new AbortController();
+	const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+	let fetchSignal: AbortSignal;
+	if (signal) {
+		signal.addEventListener("abort", () => controller.abort());
+		fetchSignal = controller.signal;
+	} else {
+		fetchSignal = controller.signal;
+	}
+
+	let response: Response;
+	let finalUrl = url;
+	try {
+		response = await fetch(url, { signal: fetchSignal, headers });
+		finalUrl = response.url || url;
+	} catch (err: any) {
+		clearTimeout(timeoutId);
+		if (err.name === "AbortError") {
+			throw new Error(`Request timed out after ${timeout}ms`);
+		}
+		throw new Error(`Fetch failed: ${err.message}`);
+	}
+	clearTimeout(timeoutId);
+
+	if (!response.ok) {
+		throw new Error(`Request failed with status ${response.status}`);
+	}
+
+	const contentLength = response.headers.get("content-length");
+	if (contentLength && parseInt(contentLength) > MAX_RESPONSE_SIZE) {
+		throw new Error(`Response too large: ${contentLength} bytes (max ${MAX_RESPONSE_SIZE})`);
+	}
+
+	const contentType = response.headers.get("content-type") || "";
+	const html = await response.text();
+
+	let resultText: string;
+	let title: string | undefined;
+	let extractor = "none";
+
+	// Try GitHub first
+	if (url.includes("github.com")) {
+		const githubContent = await fetchGitHubContent(url);
+		if (githubContent) {
+			resultText = githubContent;
+			extractor = "github-api";
+		}
+	}
+
+	// If not GitHub or GitHub fetch failed, try HTML extraction
+	if (extractor === "none") {
+		if (contentType.includes("text/html")) {
+			const readable = await extractWithReadability(html, finalUrl, extractMode);
+			if (readable?.text) {
+				resultText = readable.text;
+				title = readable.title;
+				extractor = "readability";
+			} else {
+				const basic = extractBasicHtml(html, extractMode);
+				if (basic?.text) {
+					resultText = basic.text;
+					title = basic.title;
+					extractor = "basic-html";
+				} else {
+					throw new Error("Failed to extract content from page");
+				}
+			}
+		} else if (contentType.includes("text/markdown") || contentType.includes("text/x-markdown")) {
+			resultText = html;
+			extractor = "raw";
+		} else if (contentType.includes("application/json")) {
+			try {
+				resultText = JSON.stringify(JSON.parse(html), null, 2);
+				extractor = "json";
+			} catch {
+				resultText = html;
+				extractor = "raw";
+			}
+		} else {
+			resultText = html;
+			extractor = "raw";
+		}
+	}
+
+	if (title && extractMode === "markdown" && !resultText.startsWith("# ")) {
+		resultText = `# ${title}\n\n${resultText}`;
+	}
+
+	return { text: resultText, title, extractor, contentType, finalUrl };
+}
+
+// ============
 // Main Extension
 // ============
 
 export default function webFetchExtension(pi: ExtensionAPI) {
+	// ---- Custom Tool (for LLM use, unchanged) ----
 	pi.registerTool({
 		name: "webfetch",
 		label: "Web Fetch",
@@ -680,6 +815,68 @@ export default function webFetchExtension(pi: ExtensionAPI) {
 			}
 
 			return new Text(text, 0, 0);
+		},
+	});
+
+	// ---- Custom Command (for direct user use: /webfetch <url> <output-path>) ----
+	pi.registerCommand("webfetch", {
+		description: "Fetch a URL and save the content as markdown to a file. Usage: /webfetch <url> <output-path>",
+		handler: async (args, ctx) => {
+			const trimmed = args.trim();
+			if (!trimmed) {
+				ctx.ui.notify(
+					"Usage: /webfetch <url> <output-path>\n  Example: /webfetch https://example.com ./docs/example.md",
+					"error",
+				);
+				return;
+			}
+
+			// First token is the URL, everything after is the output path
+			const firstSpace = trimmed.indexOf(" ");
+			if (firstSpace === -1) {
+				ctx.ui.notify(
+					"Missing output path. Usage: /webfetch <url> <output-path>\n  Example: /webfetch https://example.com ./docs/example.md",
+					"error",
+				);
+				return;
+			}
+
+			const url = trimmed.slice(0, firstSpace);
+			const outputPath = trimmed.slice(firstSpace + 1).trim();
+
+			if (!outputPath) {
+				ctx.ui.notify("Missing output path. Usage: /webfetch <url> <output-path>", "error");
+				return;
+			}
+
+			if (!url.startsWith("http://") && !url.startsWith("https://")) {
+				ctx.ui.notify(`Invalid URL: "${url}". URL must start with http:// or https://`, "error");
+				return;
+			}
+
+			const resolvedPath = resolve(ctx.cwd, outputPath);
+
+			ctx.ui.notify(`Fetching ${url} ...`, "info");
+
+			try {
+				const result = await fetchAndExtract(url, "markdown", ctx.signal);
+
+				// Ensure the parent directory exists
+				mkdirSync(dirname(resolvedPath), { recursive: true });
+
+				// Write the file
+				await writeFile(resolvedPath, result.text, "utf-8");
+
+				const size = result.text.length;
+				const extractorLabel =
+					result.extractor !== "none" && result.extractor !== "raw"
+						? ` (${result.extractor})`
+						: "";
+
+				ctx.ui.notify(`Saved${extractorLabel} to ${outputPath} (${formatSize(size)})`, "success");
+			} catch (err: any) {
+				ctx.ui.notify(`Failed: ${err.message}`, "error");
+			}
 		},
 	});
 }

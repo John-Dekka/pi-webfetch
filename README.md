@@ -11,6 +11,19 @@ pi install git:github.com/John-Dekka/pi-webfetch
 
 That's it. Your assistant can now read the web.
 
+### Two ways to use it
+
+**Ask the AI** — include a URL in your prompt:
+```
+what's on https://example.com?
+```
+The agent uses the `webfetch` tool automatically.
+
+**Fetch directly** — use the slash command to fetch and save to a file:
+```
+/webfetch https://example.com ./docs/example.md
+```
+
 ## What It Is
 
 WebFetch is an extension for [pi](https://pi.dev) that lets your coding assistant fetch and extract content from any URL on the web. Instead of dealing with messy HTML, ads, navigation bars, and page clutter you get clean, well-formatted content ready to read or analyze.
@@ -21,11 +34,16 @@ Think of it as giving your AI assistant a pair of reading glasses and a highligh
 
 ## How It Works
 
-Using WebFetch is straightforward:
+Using WebFetch is straightforward — two ways to get content:
 
-1. **Copy the extension** to your pi extensions folder
-2. **Use the tool** in your prompts with any URL
-3. **Get clean results** — plain text or markdown, your choice
+**Via the AI agent** — just mention a URL in your prompt. The LLM calls the built-in `webfetch` tool, fetches the page, and works with the content right in the conversation.
+
+**Via the `/webfetch` command** — type `/webfetch <url> <output-path>` in the editor. This fetches the URL, extracts clean markdown, and saves it directly to a file. No agent involved — instant download.
+
+```
+/webfetch https://github.com/user/repo ./readme.md
+/webfetch https://en.wikipedia.org/wiki/TypeScript ./typescript-wiki.md
+```
 
 The extension automatically:
 
@@ -54,7 +72,7 @@ The web is messy. Sites go down, content changes, extraction sometimes fails. We
 
 ### Large Pages Don't Break Things
 
-When a page is huge, WebFetch truncates gracefully and saves the full content to a file. You can pick up exactly where it left off using the read tool. No re-fetching, no wasted bandwidth, no truncation anxiety.
+When the AI agent fetches a huge page, the output is truncated gracefully and the full content is saved to `/tmp` so the agent can pick up exactly where it left off. The `/webfetch` command writes the full content directly to your chosen file with no truncation.
 
 ### It Just Works
 
